@@ -812,30 +812,49 @@ class HiRadixCache(RadixCache):
         if node not in self.evictable_host_leaves:
             self.evictable_host_leaves.add(node)
 
-    def get_access_time(self) -> float:
-        if self.pp_size > 1:
-            return float(self._logical_clock)
-        return time.monotonic()
+    def _ensure_node_hash_values(self, node: TreeNode) -> None:
+        if node is None or node is self.root_node:
+            return
+
+        path = []
+        cur = node
+        while cur is not None and cur is not self.root_node:
+            path.append(cur)
+            cur = cur.parent
+
+        recompute = False
+        for cur in reversed(path):
+            if cur.key is None or len(cur.key) == 0:
+                raise RuntimeError(
+                    f"PP>1 evict candidate path has invalid unhashed node: id={cur.id}"
+                )
+            if recompute or not cur.hash_value:
+                cur.hash_value = compute_node_hash_values(cur, self.page_size)
+                recompute = True
 
     def _evict_tie_breaker(self, node: TreeNode):
         """Return a rank-stable tie-breaker for eviction heap ordering.
 
         In PP>1 mode, node.id (from TreeNode.counter) can differ across
         ranks because nodes are created independently.  Use the content
-        hash instead, which is identical for the same logical node on
-        every rank.  For PP==1, node.id is fine and cheaper.
+        hash chained from root, which is identical for the same logical
+        node on every rank.  For PP==1, node.id is fine and cheaper.
         """
         if self.pp_size > 1:
-            if not node.hash_value:
-                if node.key is not None and len(node.key) > 0:
-                    node.hash_value = compute_node_hash_values(node, self.page_size)
-            last_hash = node.hash_value[-1] if node.hash_value else ""
+            self._ensure_node_hash_values(node)
             extra_key = (
                 str(node.key.extra_key)
                 if node.key is not None and node.key.extra_key is not None
                 else ""
             )
-            return (extra_key, last_hash)
+            if node is self.root_node:
+                return (extra_key, "")
+            if not node.hash_value:
+                raise RuntimeError(
+                    f"PP>1 evict candidate has no hash_value: id={node.id} "
+                    f"key_len={len(node.key) if node.key is not None else 0}"
+                )
+            return (extra_key, node.hash_value[-1])
         return node.id
 
     def evict(self, params: EvictParams) -> EvictResult:
@@ -1304,7 +1323,8 @@ class HiRadixCache(RadixCache):
     def _insert_helper_host(
         self, node: TreeNode, key: RadixKey, host_value, hash_value
     ):
-        node.last_access_time = self.get_access_time()
+        access_time = self.get_access_time()
+        node.last_access_time = access_time
         if len(key) == 0:
             return 0
 
@@ -1313,7 +1333,7 @@ class HiRadixCache(RadixCache):
         matched_length = 0
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
-            node.last_access_time = self.get_access_time()
+            node.last_access_time = access_time
             prefix_len = self.key_match_fn(node.key, key)
             key = key[prefix_len:]
             host_value = host_value[prefix_len:]
@@ -1329,7 +1349,8 @@ class HiRadixCache(RadixCache):
 
         if len(key):
             new_node = TreeNode(priority=node.priority)
-            new_node.last_access_time = self.get_access_time()
+            new_node.last_access_time = access_time
+            new_node.creation_time = access_time
             new_node.parent = node
             new_node.key = key
             new_node.value = None
@@ -1343,13 +1364,14 @@ class HiRadixCache(RadixCache):
         return matched_length
 
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
-        node.last_access_time = self.get_access_time()
+        access_time = self.get_access_time()
+        node.last_access_time = access_time
         child_key = self.get_child_key_fn(key)
         value = []
 
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
-            child.last_access_time = self.get_access_time()
+            child.last_access_time = access_time
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
@@ -1372,6 +1394,7 @@ class HiRadixCache(RadixCache):
         # child node split into new_node -> child
         new_node = TreeNode(priority=child.priority)
         new_node.last_access_time = child.last_access_time
+        new_node.creation_time = child.creation_time
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
@@ -1414,13 +1437,14 @@ class HiRadixCache(RadixCache):
             # Make sure the value len equal to the EAGLE bigram key len
             value = value[: len(key)]
 
+        access_time = self.get_access_time()
         node = self.root_node
         child_key = self.get_child_key_fn(key)
         total_prefix_length = 0
 
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
-            node.last_access_time = self.get_access_time()
+            node.last_access_time = access_time
             node.priority = max(node.priority, priority)
             prefix_len = self.key_match_fn(node.key, key)
 
@@ -1462,7 +1486,8 @@ class HiRadixCache(RadixCache):
 
         if len(key):
             new_node = TreeNode(priority=priority)
-            new_node.last_access_time = self.get_access_time()
+            new_node.last_access_time = access_time
+            new_node.creation_time = access_time
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()

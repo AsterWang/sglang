@@ -128,8 +128,10 @@ class TreeNode:
         self.key: RadixKey = None
         self.value: Optional[torch.Tensor] = None
         self.lock_ref = 0
-        self.last_access_time = time.monotonic()
-        self.creation_time = time.monotonic()
+        # Call sites set these through cache.get_access_time() so PP ranks
+        # produce identical timestamps for eviction ordering.
+        self.last_access_time: float = 0.0
+        self.creation_time: float = 0.0
 
         self.hit_count = 0
         # indicating the node is locked to protect from eviction
@@ -665,17 +667,11 @@ class RadixCache(BasePrefixCache):
         _dfs_helper(self.root_node)
         return torch.cat(values)
 
-    def inc_logical_clock(self):
-        """Increment the logical clock. Called once per scheduler batch cycle."""
-        self._logical_clock += 1
-
     def get_access_time(self) -> float:
-        """Return the current access time for LRU ordering.
-
-        Subclasses may override to use a logical clock instead of wall-clock
-        for deterministic eviction across PP ranks.
-        """
-        return time.monotonic()
+        """Return a monotonically increasing logical timestamp."""
+        ts = self._logical_clock
+        self._logical_clock += 1
+        return float(ts)
 
     ##### Internal Helper Functions #####
 
@@ -710,6 +706,7 @@ class RadixCache(BasePrefixCache):
         # New node inherits child's priority (represents shared prefix)
         new_node = TreeNode(priority=child.priority)
         new_node.last_access_time = child.last_access_time
+        new_node.creation_time = child.creation_time
         new_node.hit_count = child.hit_count
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
@@ -779,6 +776,7 @@ class RadixCache(BasePrefixCache):
         if len(key):
             new_node = TreeNode(priority=priority)
             new_node.last_access_time = access_time
+            new_node.creation_time = access_time
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
